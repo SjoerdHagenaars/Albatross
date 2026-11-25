@@ -1,0 +1,257 @@
+"""
+Team Albatross - luchtruim Rotterdam <-> Amsterdam in 3D.
+Alleen numpy en matplotlib nodig. Plakken in een leeg .py bestand en op Run drukken.
+
+Bediening in het venster:  linkermuisknop slepen = draaien | rechtermuisknop slepen = zoomen
+                           spatie = pauze | pijl omhoog/omlaag = sneller/langzamer
+"""
+import math
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+
+# ============================ INSTELLINGEN ============================
+ADOPTIE = 0.02            # aandeel autoreizigers dat vliegt (0.02 = 2%)
+AUTOS_PER_DAG = 20000     # autoritten per dag per richting (PLACEHOLDER, vervang door NDW-data)
+SNELHEID_KMH = 160        # kruissnelheid
+RANGE_KM = 200            # actieradius (alleen ter controle)
+PERSONEN = 2              # personen per voertuig
+LAGEN_M = [150, 210, 270, 330, 390, 450]   # hoogtelagen; heen = even, terug = oneven
+OFFSET_M = 400            # zijdelingse afstand van de rijbaan tot de hartlijn
+H_SEP, V_SEP = 300, 50    # minimale scheiding horizontaal / verticaal [m]
+LANE_HEADWAY_S = 60       # minimale tijd tussen twee voertuigen op dezelfde laag
+VP_SLOT_S = 40            # minimale tijd tussen twee start/landingen per vertiport
+MAX_WACHT_S = 1200        # langer wachten op de grond = vraag valt weg
+KLIM_MS = 5.0             # stijg- en daalsnelheid [m/s]
+HOOGTE_UITVERGROTING = 14 # alleen voor het plaatje, anders zie je de lagen niet
+SPEED = 60                # afspeelsnelheid (60 = 1 minuut per seconde)
+START_UUR = 8.5           # starttijd van de animatie (8.5 = 08:30)
+SEED = 1
+
+V = SNELHEID_KMH / 3.6    # m/s
+
+# ============================ GEGEVENS ============================
+REF = (52.10, 4.70)
+def xy(lat, lon):         # lat/lon -> meters
+    return np.array([(lon - REF[1]) * math.cos(math.radians(REF[0])) * 111320.0,
+                     (lat - REF[0]) * 110574.0])
+
+# naam: (lat, lon, stad, gewicht)
+VERTIPORTS = {
+    "R Centrum": (51.9225, 4.4792, "R", .45), "R Alexander": (51.9526, 4.5532, "R", .30),
+    "R Zuid": (51.8870, 4.4876, "R", .25),   "A Centrum": (52.3792, 4.9003, "A", .35),
+    "A Zuid": (52.3389, 4.8730, "A", .30),   "A Sloterdijk": (52.3890, 4.8370, "A", .15),
+    "A Zuidoost": (52.3144, 4.9466, "A", .20)}
+VP = {k: xy(v[0], v[1]) for k, v in VERTIPORTS.items()}
+
+# luchtsnelwegen: hartlijn van Rotterdam naar Amsterdam + welke vertiports erop aansluiten
+CORRIDORS = {
+    "West": ([(51.985, 4.515), (52.07, 4.51), (52.20, 4.52), (52.33, 4.60), (52.44, 4.76)],
+             {"R Centrum", "R Alexander", "A Sloterdijk", "A Centrum"}),
+    "Oost": ([(51.985, 4.63), (52.015, 4.71), (52.16, 4.78), (52.235, 4.93)],
+             {"R Alexander", "R Zuid", "A Zuidoost", "A Zuid", "A Centrum"})}
+
+# verboden zones (cirkel): naam, lat, lon, straal [m]
+NOFLY = [("Schiphol", 52.3105, 4.7683, 6000), ("Rotterdam Airport", 51.9569, 4.4372, 3000)]
+
+def rechts_verschuiven(p, d):      # lijn d meter naar rechts verschuiven (rijden aan de rechterkant)
+    seg = np.diff(p, axis=0); t = seg / np.linalg.norm(seg, axis=1)[:, None]
+    n = np.column_stack([t[:, 1], -t[:, 0]]); out = p.copy()
+    out[0] += d * n[0]; out[-1] += d * n[-1]
+    for i in range(1, len(p) - 1):
+        m = n[i - 1] + n[i]; m /= np.linalg.norm(m); out[i] += d * m / max(m @ n[i], .5)
+    return out
+
+# ============================ ROUTES ============================
+ROUTES = {}   # (van, naar, corridor) -> dict
+for cname, (wps, access) in CORRIDORS.items():
+    c = np.array([xy(*p) for p in wps])
+    for o in access:
+        for d in access:
+            if VERTIPORTS[o][2] == "R" and VERTIPORTS[d][2] == "A":
+                lane = rechts_verschuiven(c, OFFSET_M)
+                zuid_naar_noord = True
+            elif VERTIPORTS[o][2] == "A" and VERTIPORTS[d][2] == "R":
+                lane = rechts_verschuiven(c[::-1], OFFSET_M); zuid_naar_noord = False
+            else:
+                continue
+            pts = np.vstack([VP[o], lane, VP[d]])
+            cum = np.concatenate([[0], np.cumsum(np.linalg.norm(np.diff(pts, axis=0), axis=1))])
+            ROUTES[(o, d, cname)] = dict(pts=pts, cum=cum, L=cum[-1], richting=0 if zuid_naar_noord else 1,
+                                         s_in=cum[1])
+
+def hoogte(alt, s, L):
+    return np.maximum(np.minimum(np.minimum(alt, KLIM_MS / V * s), KLIM_MS / V * (L - s)), 0)
+
+# ============================ VRAAG ============================
+rng = np.random.default_rng(SEED)
+UURPROFIEL = np.array([.4, .25, .2, .2, .4, 1.2, 3.5, 6.8, 7.2, 5.5, 4.6, 4.8,
+                       5.2, 5.0, 5.3, 6.2, 7.6, 8.0, 6.4, 4.6, 3.2, 2.3, 1.5, 0.9])
+UURPROFIEL = UURPROFIEL / UURPROFIEL.sum()
+bezetting = {1: .70, 2: .22, 3: .05, 4: .03}                  # personen per auto
+ritten_per_auto = sum(p * math.ceil(n / PERSONEN) for n, p in bezetting.items())
+
+aanvragen = []
+for richting, van_stad in ((0, "R"), (1, "A")):
+    van = [k for k, v in VERTIPORTS.items() if v[2] == van_stad]
+    naar = [k for k, v in VERTIPORTS.items() if v[2] != van_stad]
+    paren = [(o, d) for o in van for d in naar if any((o, d, c) in ROUTES for c in CORRIDORS)]
+    w = np.array([VERTIPORTS[o][3] * VERTIPORTS[d][3] for o, d in paren]); w /= w.sum()
+    for uur in range(24):
+        n = rng.poisson(AUTOS_PER_DAG * UURPROFIEL[uur] * ADOPTIE * ritten_per_auto)
+        for t in uur * 3600 + rng.uniform(0, 3600, n):
+            o, d = paren[rng.choice(len(paren), p=w)]
+            aanvragen.append((t, o, d))
+aanvragen.sort()
+
+# ============================ PLANNING ============================
+# Elke vlucht krijgt corridor + hoogtelaag + vertrektijd zodat de slots vrij zijn.
+agenda = {}      # resource -> lijst met tijden
+def vrij(res, t, gap):
+    return all(abs(t - x) >= gap for x in agenda.get(res, []))
+
+# Ruimtelijke controle: van elke geplande vlucht staan de posities per tijdstap (DT s) in een tabel.
+# Een nieuwe vlucht mag pas vertrekken als hij op geen enkel moment te dicht bij een andere komt.
+DT, MAXV = 4.0, 150
+STAPPEN = int(90000 / DT)
+OX = np.full((STAPPEN, MAXV), np.nan); OY = OX.copy(); OZ = OX.copy(); AANTAL = np.zeros(STAPPEN, dtype=int)
+H_PLAN, V_PLAN = 2 * H_SEP, 1.5 * V_SEP          # planningsmarge boven de minimale scheiding
+
+def pad(r, alt, t0):
+    ks = np.arange(math.ceil(t0 / DT), math.floor((t0 + r["L"] / V) / DT) + 1)
+    s = (ks * DT - t0) * V
+    return ks, np.interp(s, r["cum"], r["pts"][:, 0]), np.interp(s, r["cum"], r["pts"][:, 1]), hoogte(alt, s, r["L"])
+
+def geen_conflict(r, alt, t0):
+    ks, x, y, z = pad(r, alt, t0)
+    bots = ((OX[ks] - x[:, None]) ** 2 + (OY[ks] - y[:, None]) ** 2 < H_PLAN ** 2) & (np.abs(OZ[ks] - z[:, None]) < V_PLAN)
+    return not bots.any()
+
+def boek(r, alt, t0):
+    ks, x, y, z = pad(r, alt, t0)
+    plek = AANTAL[ks]; OX[ks, plek] = x; OY[ks, plek] = y; OZ[ks, plek] = z; AANTAL[ks] += 1
+
+vluchten, afgewezen = [], 0
+for t_req, o, d in aanvragen:
+    beste = None
+    for c in CORRIDORS:
+        r = ROUTES.get((o, d, c))
+        if r is None:
+            continue
+        for laag in range(r["richting"], len(LAGEN_M), 2):
+            t = t_req
+            while t - t_req <= MAX_WACHT_S:
+                t_in, t_aan = t + r["s_in"] / V, t + r["L"] / V
+                if (vrij(o, t, VP_SLOT_S) and vrij(d, t_aan, VP_SLOT_S)
+                        and vrij((c, r["richting"], laag), t_in, LANE_HEADWAY_S)
+                        and geen_conflict(r, LAGEN_M[laag], t)):
+                    break
+                t += 5
+            else:
+                continue
+            if beste is None or t_aan < beste[0]:
+                beste = (t_aan, t, c, laag, r)
+    if beste is None:
+        afgewezen += 1
+        continue
+    t_aan, t, c, laag, r = beste
+    boek(r, LAGEN_M[laag], t)
+    agenda.setdefault(o, []).append(t); agenda.setdefault(d, []).append(t_aan)
+    agenda.setdefault((c, r["richting"], laag), []).append(t + r["s_in"] / V)
+    vluchten.append(dict(t0=t, t1=t_aan, r=r, alt=LAGEN_M[laag], req=t_req, naam=f"{o}>{d}"))
+
+t0s = np.array([f["t0"] for f in vluchten]); t1s = np.array([f["t1"] for f in vluchten])
+
+def posities(t):
+    """x, y [km], z [m], richting van alle voertuigen die op tijd t in de lucht zijn"""
+    idx = np.nonzero((t0s <= t) & (t <= t1s))[0]
+    X, Y, Z, R = [], [], [], []
+    for i in idx:
+        f = vluchten[i]; r = f["r"]; s = (t - f["t0"]) * V
+        X.append(np.interp(s, r["cum"], r["pts"][:, 0]) / 1000)
+        Y.append(np.interp(s, r["cum"], r["pts"][:, 1]) / 1000)
+        Z.append(float(hoogte(f["alt"], s, r["L"]))); R.append(r["richting"])
+    return np.array(X), np.array(Y), np.array(Z), np.array(R)
+
+# ============================ VEILIGHEIDSCONTROLE ============================
+def controle(dt=2.0):
+    """Zet elk voertuig op tijdstappen van dt seconden en zoekt paren die te dicht bij elkaar komen."""
+    paren = set()
+    for k in range(int(t0s.min() // dt), int(t1s.max() // dt) + 1):
+        t = k * dt
+        idx = np.nonzero((t0s <= t) & (t <= t1s))[0]
+        if len(idx) < 2:
+            continue
+        P = np.array([[np.interp((t - vluchten[i]["t0"]) * V, vluchten[i]["r"]["cum"], vluchten[i]["r"]["pts"][:, 0]),
+                       np.interp((t - vluchten[i]["t0"]) * V, vluchten[i]["r"]["cum"], vluchten[i]["r"]["pts"][:, 1]),
+                       float(hoogte(vluchten[i]["alt"], (t - vluchten[i]["t0"]) * V, vluchten[i]["r"]["L"]))] for i in idx])
+        dh = np.hypot(P[:, None, 0] - P[None, :, 0], P[:, None, 1] - P[None, :, 1])
+        dz = np.abs(P[:, None, 2] - P[None, :, 2])
+        a, b = np.nonzero(np.triu((dh < H_SEP) & (dz < V_SEP), 1))
+        paren.update((idx[i], idx[j]) for i, j in zip(a, b))
+    return len(paren)
+
+wacht = np.array([f["t0"] - f["req"] for f in vluchten])
+print(f"Aanvragen: {len(aanvragen)}   gepland: {len(vluchten)}   afgewezen: {afgewezen}")
+print(f"Gemiddelde wachttijd op de grond: {wacht.mean():.0f} s   (max {wacht.max():.0f} s)")
+print(f"Gemiddelde vluchtduur: {np.mean(t1s - t0s) / 60:.1f} min   langste route: "
+      f"{max(r['L'] for r in ROUTES.values()) / 1000:.0f} km (range {RANGE_KM} km)")
+print("Veiligheidscontrole bezig...")
+print(f"Voertuigparen te dicht bij elkaar (<{H_SEP} m en <{V_SEP} m): {controle()}")
+
+# ============================ 3D ANIMATIE ============================
+fig = plt.figure(figsize=(13, 8))
+ax = fig.add_subplot(111, projection="3d")
+BLAUW, ORANJE, ROOD = "#1f5fa8", "#d2561b", "#b3261e"
+
+for cname, (wps, _) in CORRIDORS.items():
+    c = np.array([xy(*p) for p in wps])
+    for richting, kleur in ((0, BLAUW), (1, ORANJE)):
+        lane = rechts_verschuiven(c if richting == 0 else c[::-1], OFFSET_M) / 1000
+        for laag in range(richting, len(LAGEN_M), 2):
+            ax.plot(lane[:, 0], lane[:, 1], np.full(len(lane), LAGEN_M[laag]), color=kleur, lw=.8, alpha=.5)
+        ax.plot(lane[:, 0], lane[:, 1], np.zeros(len(lane)), color=kleur, lw=.6, alpha=.2)
+for naam, lat, lon, straal in NOFLY:
+    c = xy(lat, lon) / 1000; th = np.linspace(0, 2 * np.pi, 80); r = straal / 1000
+    for z in (0, 1000):
+        ax.plot(c[0] + r * np.cos(th), c[1] + r * np.sin(th), np.full(80, z), color=ROOD, lw=1.2)
+    for th_ in np.linspace(0, 2 * np.pi, 12, endpoint=False):
+        ax.plot([c[0] + r * np.cos(th_)] * 2, [c[1] + r * np.sin(th_)] * 2, [0, 1000], color=ROOD, lw=.5, alpha=.4)
+    ax.text(c[0], c[1], 1050, naam, color=ROOD, ha="center", fontsize=8)
+for naam, p in VP.items():
+    ax.scatter(p[0] / 1000, p[1] / 1000, 0, marker="s", color="black", s=22)
+    ax.text(p[0] / 1000, p[1] / 1000, 60, naam, fontsize=7)
+
+allpts = np.vstack([r["pts"] for r in ROUTES.values()]) / 1000
+ax.set_xlim(allpts[:, 0].min() - 3, allpts[:, 0].max() + 3)
+ax.set_ylim(allpts[:, 1].min() - 3, allpts[:, 1].max() + 3)
+ax.set_zlim(0, 1100)
+ax.set_box_aspect((np.ptp(ax.get_xlim()), np.ptp(ax.get_ylim()), 1.1 * HOOGTE_UITVERGROTING))
+ax.set_xlabel("x [km]"); ax.set_ylabel("y [km]"); ax.set_zlabel("hoogte [m]")
+ax.view_init(elev=28, azim=-60)
+sc = ax.scatter([], [], [], s=36, depthshade=False)
+titel = ax.set_title("")
+state = dict(t=START_UUR * 3600, speed=SPEED, play=True)
+
+def update(_):
+    if state["play"]:
+        state["t"] = (state["t"] + state["speed"] * 0.04) % 86400
+    X, Y, Z, R = posities(state["t"])
+    sc._offsets3d = (X, Y, Z)
+    sc.set_color([BLAUW if r == 0 else ORANJE for r in R] if len(R) else [BLAUW])
+    h, m = int(state["t"] // 3600), int(state["t"] % 3600 // 60)
+    titel.set_text(f"{h:02d}:{m:02d}   |   {len(X)} voertuigen in de lucht   |   {state['speed']}x   "
+                   f"(spatie = pauze, pijltjes = snelheid)")
+    return sc,
+
+def toets(e):
+    if e.key == " ":
+        state["play"] = not state["play"]
+    elif e.key == "up":
+        state["speed"] = min(state["speed"] * 2, 1200)
+    elif e.key == "down":
+        state["speed"] = max(state["speed"] // 2, 5)
+fig.canvas.mpl_connect("key_press_event", toets)
+
+anim = FuncAnimation(fig, update, interval=40, blit=False, cache_frame_data=False)
+plt.show()
